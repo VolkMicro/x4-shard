@@ -545,6 +545,7 @@ class Shard:
     async def register_loop(self, target):
         host, port = target.rsplit(":", 1)
         while True:
+            listed = False
             try:
                 reader, writer = await asyncio.wait_for(asyncio.open_connection(host, int(port)), 10)
                 writer.write(("|".join(str(f) for f in ("REGISTER", self.me["name"], self.me["host"], self.me["port"],
@@ -552,11 +553,13 @@ class Shard:
                 await writer.drain()
                 reply = (await asyncio.wait_for(reader.readline(), 15)).decode("utf-8", "replace").strip()
                 writer.close()
-                if reply != "OK":
+                listed = reply == "OK"
+                if not listed:
                     log.info("directory %s did not list this shard: %s", target, reply or "no answer")
             except (OSError, asyncio.TimeoutError) as err:
                 log.info("directory %s unreachable: %s", target, err)
-            await asyncio.sleep(REGISTER_EVERY)
+            # not listed yet (the directory starting up too, say): try again soon
+            await asyncio.sleep(REGISTER_EVERY if listed else 3)
 
 
 async def main():

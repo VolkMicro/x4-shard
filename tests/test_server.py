@@ -72,12 +72,17 @@ def value(lines, prefix):
 
 
 async def scenario(tmp):
-    c = await Client.connect()
-    c.send("LIST", "2")
-    got = await c.lines()
-    names = [l.split("|")[1] for l in got if l.startswith("SERVER|")]
+    # the second shard lists itself once both have started (a slow machine may need a retry of its REGISTER)
+    for _ in range(40):
+        c = await Client.connect()
+        c.send("LIST", "3")
+        got = await c.lines()
+        await c.close()
+        names = [l.split("|")[1] for l in got if l.startswith("SERVER|")]
+        if len(names) > 1:
+            break
+        await asyncio.sleep(0.5)
     assert names == ["Test Home", "Test B"] and got[-1] == "END", got
-    await c.close()
 
     # the list only takes shards under a free name that really answer at the address they give
     for name, port, why in (("Test B", 47197, "name taken"), ("Test Home", 47197, "name taken"),
@@ -201,6 +206,7 @@ async def scenario(tmp):
 
 
 def main():
+    sys.stdout.reconfigure(errors="replace")   # server logs may carry localized OS messages
     tmp = tempfile.mkdtemp()
     common = [sys.executable, "-I", os.path.join(ROOT, "server", "shard_server.py"), "--host", "127.0.0.1"]
     home = subprocess.Popen(common + ["--port", str(PORT), "--name", "Test Home", "--directory",
