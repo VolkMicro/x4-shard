@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<content id="x4shard" name="X4 Shard" description="A shared world for X4: clean universe, the world and other players come from the server. Needs Protected UI Mode off (Settings, Extensions)." author="MicroVolk" version="11" date="2026-11-04" save="0" enabled="1">
+  <dependency version="900" />
+</content>

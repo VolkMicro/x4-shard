@@ -1,0 +1,52 @@
+# Builds the network module from source, tests the server, packs the release archives. On a v* tag it also
+# publishes a GitHub release with SHA256SUMS and a build provenance attestation for the DLL and the archives.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64-win32
+
+      - name: Network module
+        run: bash native/build.sh
+
+      - name: Server tests
+        run: python3 -I tests/test_server.py
+
+      - name: Archives
+        run: |
+          python3 -I tools/make_dist.py
+          cp extension/x4shard/native/x4shardnet_64.dll dist/
+          cd dist && sha256sum x4shardnet_64.dll *.zip | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x4shard
+          path: dist/
+
+      - name: Attest
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/x4shardnet_64.dll, dist/*.zip"
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/x4shardnet_64.dll dist/SHA256SUMS --title "X4 Shard $GITHUB_REF_NAME" --notes-file CHANGELOG.md

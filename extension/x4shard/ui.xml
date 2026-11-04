@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<addon name="x4shard">
+  <environment type="menus">
+    <file name="ui/x4shard_config.lua" />
+    <file name="ui/x4shard_net.lua" />
+    <file name="ui/x4shard_menu.lua" />
+    <!-- the player's identity key and recent shards; the game keeps it in its user data (Steam Cloud) -->
+    <savedvariable name="X4ShardSaved" storage="userdata" />
+  </environment>
+</addon>

@@ -1,0 +1,7 @@
+dist/
+native/build/
+extension/x4shard/native/*.dll
+server/accounts*.json
+server/*.invite
+__pycache__/
+*.pyc

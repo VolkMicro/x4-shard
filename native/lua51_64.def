@@ -1,0 +1,11 @@
+LIBRARY lua51_64.dll
+EXPORTS
+lua_pushnil
+lua_pushboolean
+lua_pushinteger
+lua_pushstring
+lua_pushlstring
+lua_createtable
+luaL_checklstring
+luaL_checkinteger
+luaL_register

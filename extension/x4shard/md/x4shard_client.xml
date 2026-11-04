@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mdscript name="X4Shard_Client" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="md.xsd">
+  <!-- MD side of the X4 Shard client, active only in the x4shard gamestart.
+       Tick: drives ui/x4shard_net.lua every frame (network, interpolation, puppet placement).
+       Purge: whatever the server did not ask for is removed (stock start scripts still place Xenon and
+       abandoned ships with god/jobs off): first at 2 s, then every 30 s.
+       Spawn/despawn/move/notify: requests from Lua (AddUITriggeredEvent "x4shard"); each created object is
+       reported back with two Lua events in a row, the server's entity id and then the component.
+       MD notes (probe 1): a reset_cue loop needs a delay or it re-runs within the same frame and freezes the game;
+       (expr)f strips units, (degrees)deg makes an angle. -->
+  <cues>
+    <cue name="Start" namespace="this" module="x4shard">
+      <conditions>
+        <event_cue_signalled cue="md.Setup.GameStart" />
+      </conditions>
+      <actions>
+        <set_value name="Start.$T0" exact="player.age" />
+        <set_value name="Start.$Owned" exact="[]" />
+        <set_value name="Start.$PurgeRound" exact="0" />
+        <set_value name="Start.$PurgedTotal" exact="0" />
+        <set_value name="Start.$Minable" exact="[ware.ore, ware.silicon, ware.ice, ware.nividium, ware.hydrogen, ware.helium, ware.methane]" />
+        <set_value name="Start.$CargoSeen" exact="table[]" />
+        <do_for_each name="$Ware" in="Start.$Minable">
+          <set_value name="Start.$CargoSeen.{$Ware}" exact="0" />
+        </do_for_each>
+        <debug_text text="'[x4shard] client start in ' + player.sector.knownname + ' (' + player.sector.macro.id + ') ship ' + @player.occupiedship.knownname" filter="general" />
+      </actions>
+      <cues>
+
+        <cue name="Tick">
+          <delay exact="1ms" />
+          <actions>
+            <raise_lua_event name="'x4shard.tick'" />
+            <reset_cue cue="this" />
+          </actions>
+        </cue>
+
+        <cue name="Purge" checkinterval="1s">
+          <conditions>
+            <check_value value="player.age ge Start.$T0 + 2s + Start.$PurgeRound * 30s" />
+          </conditions>
+          <actions>
+            <set_value name="Start.$PurgeRound" operation="add" />
+            <find_station name="$Stations" space="player.galaxy" multiple="true" />
+            <find_ship name="$Ships" space="player.galaxy" multiple="true" />
+            <set_value name="$Removed" exact="0" />
+            <do_for_each name="$Obj" in="$Stations">
+              <do_if value="$Obj.owner != faction.player and Start.$Owned.indexof.{$Obj} == 0">
+                <destroy_object object="$Obj" explosion="false" />
+                <set_value name="$Removed" operation="add" />
+              </do_if>
+            </do_for_each>
+            <do_for_each name="$Obj" in="$Ships">
+              <do_if value="$Obj.exists and $Obj.owner != faction.player and $Obj != player.occupiedship and Start.$Owned.indexof.{$Obj} == 0">
+                <destroy_object object="$Obj" explosion="false" />
+                <set_value name="$Removed" operation="add" />
+              </do_if>
+            </do_for_each>
+            <set_value name="Start.$PurgedTotal" operation="add" exact="$Removed" />
+            <debug_text text="'[x4shard] purge ' + Start.$PurgeRound + ' t=' + (player.age - Start.$T0) + ' stations=' + $Stations.count + ' ships=' + $Ships.count + ' removed=' + $Removed + ' total_removed=' + Start.$PurgedTotal + ' owned=' + Start.$Owned.count" filter="general" />
+            <reset_cue cue="this" />
+          </actions>
+        </cue>
+
+        <!-- param: [eid, kind (station|npc|puppet), macro id, owner faction id, x, y, z, yaw degrees, name, plan] -->
+        <cue name="OnSpawn" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'spawn'" />
+          </conditions>
+          <actions>
+            <set_value name="$P" exact="event.param3" />
+            <set_value name="$Kind" exact="$P.{2}" />
+            <set_value name="$Obj" exact="null" />
+            <do_if value="$Kind == 'station'">
+              <create_station name="$Obj" macro="macro.{$P.{3}}" owner="faction.{$P.{4}}" sector="player.sector" state="componentstate.operational" constructionplan="$P.{10}">
+                <position x="$P.{5}" y="$P.{6}" z="$P.{7}" />
+              </create_station>
+              <set_known object="$Obj" known="true" />
+              <set_object_scanned object="$Obj" />
+              <!-- without its crew a scripted station refuses docking ("Docking not possible"), as in scenario_advanced -->
+              <create_control_entity object="$Obj" post="controlpost.manager">
+                <select faction="$Obj.owner" tags="controlpost.manager.tag" />
+                <owner exact="$Obj.owner" />
+              </create_control_entity>
+              <create_control_entity object="$Obj" post="controlpost.defence">
+                <select tags="controlpost.defence.tag" />
+                <owner exact="$Obj.owner" />
+              </create_control_entity>
+            </do_if>
+            <do_elseif value="$Kind == 'npc'">
+              <create_ship name="$Obj" macro="macro.{$P.{3}}" sector="player.sector">
+                <owner exact="faction.{$P.{4}}" overridenpc="true" />
+                <loadout>
+                  <level exact="0.5" />
+                </loadout>
+                <pilot>
+                  <select race="race.argon" tags="tag.aipilot" />
+                </pilot>
+                <position x="$P.{5}" y="$P.{6}" z="$P.{7}" />
+                <rotation yaw="($P.{8})deg" pitch="0deg" roll="0deg" />
+              </create_ship>
+            </do_elseif>
+            <do_else>
+              <create_ship name="$Obj" macro="macro.{$P.{3}}" sector="player.sector">
+                <owner exact="faction.{$P.{4}}" overridenpc="true" />
+                <position x="$P.{5}" y="$P.{6}" z="$P.{7}" />
+                <rotation yaw="($P.{8})deg" pitch="0deg" roll="0deg" />
+              </create_ship>
+              <do_if value="$Obj">
+                <set_object_min_hull object="$Obj" exact="100" />
+              </do_if>
+            </do_else>
+            <do_if value="$Obj">
+              <do_if value="$P.{9} != ''">
+                <set_object_name object="$Obj" name="$P.{9}" />
+              </do_if>
+              <append_to_list name="Start.$Owned" exact="$Obj" />
+            </do_if>
+            <debug_text text="'[x4shard] spawn ' + $P.{1} + ' ' + $Kind + ' ' + $P.{3} + ' -> ' + $Obj" filter="general" />
+            <raise_lua_event name="'x4shard.spawned_eid'" param="$P.{1}" />
+            <raise_lua_event name="'x4shard.spawned'" param="$Obj" />
+          </actions>
+        </cue>
+
+        <cue name="OnDespawn" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'despawn'" />
+          </conditions>
+          <actions>
+            <set_value name="$Obj" exact="event.param3.{1}" />
+            <do_if value="$Obj.exists">
+              <remove_from_list name="Start.$Owned" exact="$Obj" />
+              <destroy_object object="$Obj" explosion="false" />
+            </do_if>
+          </actions>
+        </cue>
+
+        <!-- fallback mover when SetObjectSectorPos does not stick: [component, x, y, z, yaw, pitch, roll] -->
+        <cue name="OnMove" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'move'" />
+          </conditions>
+          <actions>
+            <set_value name="$P" exact="event.param3" />
+            <do_if value="$P.{1}.exists">
+              <warp object="$P.{1}" sector="player.sector">
+                <position x="$P.{2}" y="$P.{3}" z="$P.{4}" />
+                <rotation yaw="($P.{5})deg" pitch="($P.{6})deg" roll="($P.{7})deg" />
+              </warp>
+            </do_if>
+          </actions>
+        </cue>
+
+        <!-- Cargo watch, once a second: growth of a minable ware in the player's ship goes to the server as mined;
+             shrinking (sold, jettisoned, corrected by the server) only moves the mark. -->
+        <cue name="CargoWatch">
+          <delay exact="1s" />
+          <actions>
+            <set_value name="$Ship" exact="player.occupiedship" />
+            <do_if value="$Ship">
+              <do_for_each name="$Ware" in="Start.$Minable">
+                <set_value name="$Have" exact="$Ship.cargo.{$Ware}.count" />
+                <do_if value="$Have gt Start.$CargoSeen.{$Ware}">
+                  <raise_lua_event name="'x4shard.mined'" param="$Ware.id + '|' + ($Have - Start.$CargoSeen.{$Ware})" />
+                </do_if>
+                <set_value name="Start.$CargoSeen.{$Ware}" exact="$Have" />
+              </do_for_each>
+            </do_if>
+            <reset_cue cue="this" />
+          </actions>
+        </cue>
+
+        <!-- Server truth for one ware in the player's ship: [ware id, amount] -->
+        <cue name="OnCargo" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'cargo'" />
+          </conditions>
+          <actions>
+            <set_value name="$Ware" exact="ware.{event.param3.{1}}" />
+            <set_value name="$Want" exact="event.param3.{2}" />
+            <set_value name="$Ship" exact="player.occupiedship" />
+            <do_if value="$Ship and $Ware">
+              <set_value name="$Have" exact="$Ship.cargo.{$Ware}.count" />
+              <do_if value="$Want gt $Have">
+                <add_cargo object="$Ship" ware="$Ware" exact="$Want - $Have" />
+              </do_if>
+              <do_elseif value="$Want lt $Have">
+                <remove_cargo object="$Ship" ware="$Ware" exact="$Have - $Want" />
+              </do_elseif>
+              <set_value name="Start.$CargoSeen.{$Ware}" exact="$Ship.cargo.{$Ware}.count" />
+              <do_if value="$Want != $Have">
+                <debug_text text="'[x4shard] cargo ' + $Ware.id + ': ' + $Have + ' -> ' + $Ship.cargo.{$Ware}.count + ' (server ' + $Want + ')'" filter="general" />
+              </do_if>
+            </do_if>
+          </actions>
+        </cue>
+
+        <!-- Server truth for the wallet: [credits] -->
+        <cue name="OnWallet" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'wallet'" />
+          </conditions>
+          <actions>
+            <set_value name="$Want" exact="(event.param3.{1})Cr" />
+            <set_value name="$Before" exact="player.money" />
+            <do_if value="$Want gt $Before">
+              <transfer_money from="faction.ownerless" to="faction.player" amount="$Want - $Before" />
+            </do_if>
+            <do_elseif value="$Want lt $Before">
+              <transfer_money from="faction.player" to="faction.ownerless" amount="$Before - $Want" />
+            </do_elseif>
+            <debug_text text="'[x4shard] wallet ' + $Before + ' -> ' + player.money" filter="general" />
+          </actions>
+        </cue>
+
+        <!-- The player's ship docked: at a station the server put into the world, ask Lua to sell. -->
+        <cue name="OnDocked" instantiate="true">
+          <conditions>
+            <event_object_docked object="player.occupiedship" />
+          </conditions>
+          <actions>
+            <set_value name="$Station" exact="if event.param.isclass.station then event.param else @event.param.container" />
+            <debug_text text="'[x4shard] docked at ' + @$Station.knownname + ' (dock ' + event.param + ')'" filter="general" />
+            <do_if value="$Station and Start.$Owned.indexof.{$Station} gt 0">
+              <raise_lua_event name="'x4shard.docked'" param="$Station" />
+            </do_if>
+          </actions>
+        </cue>
+
+        <!-- Scripted tests from the server (TEST lines): simulated mining [ware id, amount], autopilot [station] -->
+        <cue name="OnTestMine" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'testmine'" />
+          </conditions>
+          <actions>
+            <set_value name="$Ware" exact="ware.{event.param3.{1}}" />
+            <do_if value="player.occupiedship and $Ware">
+              <add_cargo object="player.occupiedship" ware="$Ware" exact="event.param3.{2}" />
+              <debug_text text="'[x4shard] test mining +' + event.param3.{2} + ' ' + $Ware.id + ', in ship ' + player.occupiedship.cargo.{$Ware}.count" filter="general" />
+            </do_if>
+          </actions>
+        </cue>
+
+        <cue name="OnAutopilot" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'autopilot'" />
+          </conditions>
+          <actions>
+            <!-- with a pad assigned at that station, fly to the pad: the station itself only brings the ship near it -->
+            <set_value name="$Target" exact="event.param3.{1}" />
+            <set_value name="$Dock" exact="@player.occupiedship.assigneddock" />
+            <do_if value="$Dock and $Dock.container == $Target">
+              <set_value name="$Target" exact="$Dock" />
+            </do_if>
+            <start_player_autopilot destination="$Target" />
+            <debug_text text="'[x4shard] autopilot to ' + $Target.knownname + ' (' + $Target + ')'" filter="general" />
+          </actions>
+        </cue>
+
+        <!-- Scripted landing once docking is granted [station]: the autopilot only brings the ship to the pad,
+             the last metres are the pilot's (or this action's, as in the game's own scripted scenes). -->
+        <cue name="OnDock" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'dock'" />
+          </conditions>
+          <actions>
+            <stop_player_autopilot speak="false" />
+            <dock_player_ship_at destination="event.param3.{1}" />
+            <debug_text text="'[x4shard] dock_player_ship_at ' + event.param3.{1}.knownname" filter="general" />
+          </actions>
+        </cue>
+
+        <!-- Shard picker [labels]: the directory lists several shards, the ship computer offers up to six of them
+             as conversation choices (as md.Notifications does for PlayerOwnedAttacked); the chosen section goes back
+             to Lua. Dismissed without a choice, Lua offers the list again later. -->
+        <cue name="OnServers" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'servers'" />
+          </conditions>
+          <actions>
+            <start_conversation conversation="x4shard_servers" actor="player.computer" convparam="event.param3" type="unqueued" />
+          </actions>
+        </cue>
+
+        <cue name="OnServersConversation" instantiate="true">
+          <conditions>
+            <event_conversation_started conversation="x4shard_servers" />
+          </conditions>
+          <actions>
+            <set_value name="$L" exact="event.param2" />
+            <add_player_choice text="$L.{1}" section="x4shard_srv_1" position="top_left" />
+            <do_if value="$L.count ge 2">
+              <add_player_choice text="$L.{2}" section="x4shard_srv_2" position="left" />
+            </do_if>
+            <do_if value="$L.count ge 3">
+              <add_player_choice text="$L.{3}" section="x4shard_srv_3" position="bottom_left" />
+            </do_if>
+            <do_if value="$L.count ge 4">
+              <add_player_choice text="$L.{4}" section="x4shard_srv_4" position="top_right" />
+            </do_if>
+            <do_if value="$L.count ge 5">
+              <add_player_choice text="$L.{5}" section="x4shard_srv_5" position="right" />
+            </do_if>
+            <do_if value="$L.count ge 6">
+              <add_player_choice text="$L.{6}" section="x4shard_srv_6" position="bottom_right" />
+            </do_if>
+            <debug_text text="'[x4shard] shard picker: ' + $L.count + ' choices'" filter="general" />
+          </actions>
+        </cue>
+
+        <cue name="OnServerPicked" instantiate="true">
+          <conditions>
+            <event_conversation_next_section sectionprefix="x4shard_srv_" />
+          </conditions>
+          <actions>
+            <debug_text text="'[x4shard] shard picked: ' + event.param" filter="general" />
+            <raise_lua_event name="'x4shard.pick'" param="event.param" />
+          </actions>
+        </cue>
+
+        <cue name="OnNotify" instantiate="true">
+          <conditions>
+            <event_ui_triggered screen="'x4shard'" control="'notify'" />
+          </conditions>
+          <actions>
+            <show_notification text="event.param3.{1}" timeout="6s" />
+          </actions>
+        </cue>
+
+      </cues>
+    </cue>
+  </cues>
+</mdscript>
