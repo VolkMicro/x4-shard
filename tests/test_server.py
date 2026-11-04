@@ -222,8 +222,10 @@ def main():
         asyncio.run(asyncio.sleep(1.5))
         asyncio.run(scenario(tmp))
     finally:
-        for proc, label in ((home, "home"), (other, "B"), (private, "private")):
+        shards = ((home, "home"), (other, "B"), (private, "private"))
+        for proc, _ in shards:   # all of them first: a failure below must not leave a shard holding its port
             proc.terminate()
+        for proc, label in shards:
             print("--- %s log" % label)
             print(proc.communicate(timeout=5)[0].decode(errors="replace"))
 
