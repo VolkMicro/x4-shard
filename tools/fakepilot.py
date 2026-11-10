@@ -10,6 +10,7 @@ usage: python3 fakepilot.py [--host 127.0.0.1] [--port 47110] [--name Bot] [--se
 import argparse
 import asyncio
 import math
+import ssl
 import time
 
 RADIUS = 400.0
@@ -30,7 +31,9 @@ async def main():
                     help="circle a point this far along +z from the other player (the clean start faces +z)")
     args = ap.parse_args()
 
-    reader, writer = await asyncio.open_connection(args.host, args.port)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)   # a test bot on the shard's own machine: no fingerprint check
+    tls.check_hostname, tls.verify_mode = False, ssl.CERT_NONE
+    reader, writer = await asyncio.open_connection(args.host, args.port, ssl=tls)
     writer.write(("HELLO|%s|1\n" % args.name).encode())
     state = {"target": None, "target_eid": None, "moves": 0}
 

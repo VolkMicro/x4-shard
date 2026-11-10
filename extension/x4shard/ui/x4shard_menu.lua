@@ -59,8 +59,8 @@ function menu.onShowMenu()
 	local row = ftable:addRow(false, { fixed = true })
 	row[1]:setColSpan(2):createText("X4 Shard: connect by address", Helper.headerRowCenteredProperties)
 	row = ftable:addRow(false, { fixed = true })
-	row[1]:setColSpan(2):createText("A server's address, like 203.0.113.5:47110, or a private server's invite link, "
-		.. "like x4shard://203.0.113.5:47110/code. Type it or paste it with Ctrl+V, then Enter.", { wordwrap = true })
+	row[1]:setColSpan(2):createText("A server's address, like 203.0.113.5:47110, or the link its owner gives, like "
+		.. "x4shard://203.0.113.5:47110/code#fingerprint. Type it or paste it with Ctrl+V, then Enter.", { wordwrap = true })
 	row = ftable:addRow(true, { fixed = true })
 	menu.editBox = row[1]:setColSpan(2):createEditBox({ height = Helper.standardButtonHeight, description = "Server address",
 		maxChars = 200 }):setText(menu.text, {})

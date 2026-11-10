@@ -14,7 +14,7 @@ from xml.etree import ElementTree
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXT = os.path.join(ROOT, "extension", "x4shard")
-SERVER_FILES = ("shard_server.py", "p256.py")
+SERVER_FILES = ("shard_server.py", "p256.py", "tlscert.py")
 
 
 def readme(name, label):

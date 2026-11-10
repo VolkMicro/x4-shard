@@ -6,10 +6,14 @@ Starts a directory shard on 127.0.0.1:47199, a second shard on 47198 that regist
 address), signed Steam login on both shards (and a stolen Steam ID with another key, a replayed signature, an old
 client), the server holding a ship to what it can do (a jump to the ore field is cut back, mining counts only in
 the field, within the rate limit and the hold, trade waits after entering a sector), selling too far and at the
-hub, reconnect with the wallet kept, the private shard with no, a wrong and the right invite code.
+hub, reconnect with the wallet kept, the private shard with no, a wrong and the right invite code. Everything goes
+over TLS: the list carries each shard's certificate fingerprint (a shard that gives another one is not listed), and a
+plain-text client (X4 Shard before 0.12) is told to update.
 """
 import asyncio
+import hashlib
 import os
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -20,6 +24,7 @@ sys.path.insert(0, os.path.join(ROOT, "server"))
 import p256  # noqa: E402
 
 PORT, PORT_B, PORT_P = 47199, 47198, 47196
+PROTO = "4"
 HUB = (6000.0, 0.0, -9000.0)
 START_POS = (0.0, 0.0, -7000.0)   # where the game start puts the ship, 7 km from the ore field at the centre
 SECTOR = "cluster_13_sector001_macro"
@@ -27,14 +32,21 @@ STEAM_ID = "76561190000000001"
 KEY = p256.keygen()
 
 
+TLS = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)   # the game checks the fingerprint, not a certificate authority
+TLS.check_hostname, TLS.verify_mode = False, ssl.CERT_NONE
+
+
 class Client:
     def __init__(self, reader, writer):
         self.reader, self.writer = reader, writer
 
     @classmethod
-    async def connect(cls, port=PORT):
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    async def connect(cls, port=PORT, tls=True):
+        reader, writer = await asyncio.open_connection("127.0.0.1", port, ssl=TLS if tls else None)
         return cls(reader, writer)
+
+    def fingerprint(self):
+        return hashlib.sha256(self.writer.get_extra_info("ssl_object").getpeercert(binary_form=True)).hexdigest()
 
     @classmethod
     async def login(cls, name, steam_id=STEAM_ID, key=KEY, port=PORT, invite=None):
@@ -42,10 +54,10 @@ class Client:
         challenge."""
         c = await cls.connect(port)
         d, pub = key
-        c.send("HELLO", name, "3", steam_id, pub, *([invite] if invite is not None else []))
+        c.send("HELLO", name, PROTO, steam_id, pub, *([invite] if invite is not None else []))
         challenge = (await asyncio.wait_for(c.reader.readline(), 5)).decode().rstrip("\n").split("|")
         assert challenge[0] == "CHALLENGE", challenge
-        c.send("PROOF", p256.sign(d, ("x4shard-login|%s|%s" % (challenge[1], steam_id)).encode()))
+        c.send("PROOF", p256.sign(d, ("x4shard-login|%s|%s|%s" % (challenge[1], steam_id, c.fingerprint())).encode()))
         return c
 
     def send(self, *fields):
@@ -78,20 +90,39 @@ async def scenario(tmp):
     # the second shard lists itself once both have started (a slow machine may need a retry of its REGISTER)
     for _ in range(40):
         c = await Client.connect()
-        c.send("LIST", "3")
+        home_fp = c.fingerprint()
+        c.send("LIST", PROTO)
         got = await c.lines()
         await c.close()
-        names = [l.split("|")[1] for l in got if l.startswith("SERVER|")]
+        rows = [l.split("|") for l in got if l.startswith("SERVER|")]
+        names = [r[1] for r in rows]
         if len(names) > 1:
             break
         await asyncio.sleep(0.5)
     assert names == ["Test Home", "Test B"] and got[-1] == "END", got
+    # each row carries the certificate fingerprint the players will meet there
+    c = await Client.connect(PORT_B)
+    b_fp = c.fingerprint()
+    await c.close()
+    assert [r[6] for r in rows] == [home_fp, b_fp] and home_fp != b_fp, rows
 
-    # the list only takes shards under a free name that really answer at the address they give
-    for name, port, why in (("Test B", 47197, "name taken"), ("Test Home", 47197, "name taken"),
-                            ("Ghost", 47197, "does not answer"), ("Fake", PORT_B, "answers as Test B")):
+    # a plain-text client is an X4 Shard before 0.12: its list says to update, its login is refused with the reason
+    c = await Client.connect(tls=False)
+    c.send("LIST", PROTO)
+    got = await c.lines()
+    assert got[0].startswith("SERVER|Update X4 Shard") and got[-1] == "END", got
+    c = await Client.connect(tls=False)
+    c.send("HELLO", "Old", "3", STEAM_ID, KEY[1])
+    assert "encrypt" in (value(await c.lines(), "DENIED|") or [""])[-1], "an old client must be told to update"
+
+    # the list only takes shards under a free name that really answer at the address they give, with the
+    # certificate they give
+    for name, port, fp, why in (("Test B", 47197, b_fp, "name taken"), ("Test Home", 47197, b_fp, "name taken"),
+                                ("Ghost", 47197, b_fp, "does not answer"), ("Fake", PORT_B, b_fp, "answers as Test B"),
+                                ("Test B", PORT_B, "0" * 64, "another certificate"),
+                                ("Test B", PORT_B, "", "no fingerprint: an old server")):
         c = await Client.connect()
-        c.send("REGISTER", name, "127.0.0.1", port, 0, "")
+        c.send("REGISTER", name, "127.0.0.1", port, 0, "", fp)
         got = (await asyncio.wait_for(c.reader.readline(), 12)).decode()
         assert got.startswith("NO|"), "%s at %d (%s) must be refused: %s" % (name, port, why, got)
         await c.close()
@@ -108,10 +139,16 @@ async def scenario(tmp):
 
     # a replayed or forged signature, an old client
     c = await Client.connect()
-    c.send("HELLO", "Thief", "3", STEAM_ID, KEY[1])
+    c.send("HELLO", "Thief", PROTO, STEAM_ID, KEY[1])
     await c.lines()
-    c.send("PROOF", p256.sign(KEY[0], b"x4shard-login|00|" + STEAM_ID.encode()))
+    c.send("PROOF", p256.sign(KEY[0], ("x4shard-login|00|%s|%s" % (STEAM_ID, home_fp)).encode()))
     assert value(await c.lines(), "DENIED|"), "a signature over another challenge must be refused"
+    # a relay: shard B passes this shard's challenge on to the player, who signs it for B's certificate
+    c = await Client.connect()
+    c.send("HELLO", "Relayed", PROTO, STEAM_ID, KEY[1])
+    nonce = value(await c.lines(), "CHALLENGE|")[1]
+    c.send("PROOF", p256.sign(KEY[0], ("x4shard-login|%s|%s|%s" % (nonce, STEAM_ID, b_fp)).encode()))
+    assert value(await c.lines(), "DENIED|"), "a signature bound to another shard's certificate must be refused"
     c = await Client.connect()
     c.send("HELLO", "Old", "2", STEAM_ID, "a" * 32)
     assert value(await c.lines(), "DENIED|"), "an old client must be told to update"
@@ -170,7 +207,7 @@ async def scenario(tmp):
 
     # open to the internet: NaN poses are not relayed, a flood is cut to the rate, one address gets 8 connections
     watcher = await Client.connect()
-    watcher.send("HELLO", "Watcher", "3")
+    watcher.send("HELLO", "Watcher", PROTO)
     watcher.send("POS", SECTOR, 0, 0, 0, 0, 0, 0)
     await watcher.lines()
     c.send("POS", SECTOR, "nan", 0, 0, 0, 0, 0)
@@ -183,8 +220,11 @@ async def scenario(tmp):
     await c.close()
     await asyncio.sleep(0.3)
     held = [await Client.connect() for _ in range(8)]
-    extra = await Client.connect()
-    assert await asyncio.wait_for(extra.reader.read(), 2) == b"", "the 9th connection from one address must close"
+    try:   # closed before the TLS handshake ends
+        extra = await asyncio.wait_for(Client.connect(), 3)
+        assert await asyncio.wait_for(extra.reader.read(), 2) == b"", "the 9th connection from one address must close"
+    except (OSError, asyncio.IncompleteReadError):
+        pass
     for h in held:
         await h.close()
 
@@ -209,6 +249,8 @@ async def scenario(tmp):
         await c.close()
 
     import shard_server
+    import tlscert
+    assert tlscert.load_or_make(os.path.join(tmp, "a.json"))[2] == home_fp, "the shard keeps its certificate"
     assert shard_server.is_local("127.0.0.1") and shard_server.is_local("192.168.1.10")
     assert not shard_server.is_local("8.8.8.8")
     assert await shard_server.resolves_to("localhost", "127.0.0.1")
@@ -252,10 +294,11 @@ async def scenario(tmp):
     shard.on_mined(p, "ore", 20)
     assert p.account["cargo"]["ore"] == 257 and any("hold is full" in l for l in p.writer.lines), p.account
     shard_server.clock = time.monotonic
-    print("ok: list of 2 shards, fake listings refused, signed Steam login on both shards, stolen ID, replayed "
-          "signature and old client refused, jump to the field held back, no mining outside it, mined %d ore, sold "
-          "for %d Cr, trade waits after a sector change, hold full at 2600 m3, wallet persisted, NaN and POS flood "
-          "stopped, 8 connections per address, key-only login, private shard by invite" % (ore, ore * 50))
+    print("ok: TLS with fingerprints in the list, plain-text clients told to update, a relayed login refused, list of 2 shards, fake listings "
+          "and a wrong certificate refused, signed Steam login on both shards, stolen ID, replayed signature and old "
+          "client refused, jump to the field held back, no mining outside it, mined %d ore, sold for %d Cr, trade "
+          "waits after a sector change, hold full at 2600 m3, wallet persisted, NaN and POS flood stopped, "
+          "8 connections per address, key-only login, private shard by invite" % (ore, ore * 50))
 
 
 def main():

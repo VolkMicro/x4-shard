@@ -1,8 +1,11 @@
 -- X4 Shard client bridge.
--- Talks to shard servers over TCP, one text line per message (protocol in server/shard_server.py), through
+-- Talks to shard servers over TLS, one text line per message (protocol in server/shard_server.py), through
 -- native/x4shardnet_64.dll: X4's Lua has no sockets, but with Protected UI Mode off package.loadlib can load a Lua
 -- C module. The module is loaded only when the X4 Shard start is played: its MD (md/x4shard_client.xml) drives
 -- this file every frame with the event "x4shard.tick", and in any other game nothing of it runs.
+-- A shard has its own certificate; the game talks to it only if the certificate's fingerprint is the expected one:
+-- the directory's from the config, a listed shard's from the list, a private shard's from its invite link
+-- (x4shard://host:port/code#fingerprint); a shard joined by a bare address is remembered by its first certificate.
 -- First the directory gives the list of shards and the ship computer asks which to join (or the player types an
 -- address, ui/x4shard_menu.lua). Login is automatic: Steam ID plus a signing key made once.
 -- Spawns and despawns are asked from MD; other players' ships are placed here every frame after interpolating
@@ -119,6 +122,11 @@ local function startNet()
 	else
 		netlibError = "package.loadlib is not available"
 	end
+	if netlib and type(netlib.fingerprint) ~= "function" then   -- a module from before TLS (0.11) next to this file
+		netlibError = "the network module is older than this X4 Shard (" .. tostring(netlib.version and netlib.version())
+			.. "): install the mod again"
+		netlib = nil
+	end
 	log(string.format("network module %s: protected_ui=%s %s", cfg.dll,
 		tostring(GetUISafeModeOption and GetUISafeModeOption()),
 		netlib and ("ready, version " .. tostring(netlib.version and netlib.version())) or ("failed: " .. tostring(netlibError))))
@@ -205,30 +213,65 @@ local function netOpen()
 	log("connecting to " .. host .. ":" .. port .. " (" .. net.phase .. ")")
 end
 
+local PROTO = "4"   -- TLS, and the login signature bound to the shard's certificate
+
 local function helloLine()
 	if cfg.account then
-		return "HELLO|" .. cfg.account .. "|3\n"
+		return "HELLO|" .. cfg.account .. "|" .. PROTO .. "\n"
 	elseif identity.pub then
 		-- Steam ID may be empty (a game without Steam): the shard then knows the player by the key alone; a private
 		-- shard also wants the invite code from the address the player was given
 		local invite = net.target and net.target.invite
-		return "HELLO|" .. identity.name .. "|3|" .. identity.steamid .. "|" .. identity.pub
+		return "HELLO|" .. identity.name .. "|" .. PROTO .. "|" .. identity.steamid .. "|" .. identity.pub
 			.. (invite and ("|" .. invite) or "") .. "\n"
 	end
-	return "HELLO|" .. identity.name .. "|3\n"
+	return "HELLO|" .. identity.name .. "|" .. PROTO .. "\n"
 end
 
--- Finishes a pending connect: the directory gets LIST, a shard gets HELLO.
+local listDone, pickAgain   -- defined with the shard picker below
+
+-- The certificate the connection showed is the expected one (or the first one of a shard joined by bare address);
+-- false: closed, and the player told.
+local function certificateOk()
+	local fp = netlib.fingerprint() or ""
+	local want = net.phase == "list" and cfg.fingerprint or (net.target and net.target.fp)
+	if want and want ~= "" and fp ~= want then
+		netlib.close()
+		net.state, net.inbuf, net.outq = "idle", "", {}
+		if net.phase == "list" then
+			log("the directory " .. cfg.host .. ":" .. cfg.port .. " showed certificate " .. fp .. ", expected " .. want)
+			notify("X4 Shard: the server list did not show its known certificate, so it is not used. Shards joined before are offered.")
+			net.fails, servers = 0, {}
+			listDone()
+		else
+			log(net.target.name .. " showed certificate " .. fp .. ", expected " .. want)
+			notify("X4 Shard: " .. net.target.name .. " showed another certificate than expected, so the game does not "
+				.. "connect. If its owner reinstalled it, ask them for a new link.")
+			pickAgain(3)
+		end
+		return false
+	end
+	if net.phase == "play" and not (want and want ~= "") then
+		net.target.fp = fp   -- first visit by bare address: remembered with the shard (see remember)
+		log("first visit to " .. net.target.name .. ": certificate " .. fp)
+	end
+	return true
+end
+
+-- Finishes a pending connect (TCP and TLS): the directory gets LIST, a shard gets HELLO.
 local function netCheck()
 	if net.state ~= "connecting" then
 		return
 	end
 	local state, err = netlib.state()
 	if state == "connected" then
+		if not certificateOk() then
+			return
+		end
 		net.state = "connected"
 		if net.phase == "list" then
 			servers = {}
-			net.outq = { "LIST|3\n" }
+			net.outq = { "LIST|" .. PROTO .. "\n" }
 		else
 			net.outq = { helloLine() }
 		end
@@ -311,22 +354,30 @@ local function choose(s)
 	log("joining " .. s.name .. " at " .. addressOf(s))
 end
 
--- Shards joined before, most recent first (up to 5), as "name|host|port|invite" lines in the user data and in
--- %LOCALAPPDATA%\X4Shard\servers.txt: offered even when the directory is down or does not list them.
+-- a certificate fingerprint as the shards give it: 64 hex digits, lower case
+local function fingerprintOf(text)
+	text = tostring(text or ""):lower()
+	return (#text == 64 and text:match("^%x+$")) and text or nil
+end
+
+-- Shards joined before, most recent first (up to 5), as "name|host|port|invite|fingerprint" lines in the user data
+-- and in %LOCALAPPDATA%\X4Shard\servers.txt: offered even when the directory is down or does not list them.
 local function recentServers()
 	local list = {}
 	local text = X4ShardSaved.servers or netlib.load("servers.txt") or ""
 	for line in tostring(text):gmatch("[^\n]+") do
-		local name, host, port, invite = line:match("^([^|]*)|([%w%.%-]+)|(%d+)|?(%w*)$")
-		if name then
-			list[#list + 1] = { name = name, host = host, port = tonumber(port), invite = invite ~= "" and invite or nil }
+		local f = split(line)
+		local host, port = tostring(f[2]):match("^[%w%.%-]+$"), tonumber(f[3])
+		if host and port then
+			local invite = tostring(f[4] or ""):match("^%w+$")
+			list[#list + 1] = { name = f[1], host = host, port = port, invite = invite, fp = fingerprintOf(f[5]) }
 		end
 	end
 	return list
 end
 
 local function recentLine(s)
-	return string.format("%s|%s|%d|%s\n", (s.name:gsub("[|\n]", " ")), s.host, s.port, s.invite or "")
+	return string.format("%s|%s|%d|%s|%s\n", (s.name:gsub("[|\n]", " ")), s.host, s.port, s.invite or "", s.fp or "")
 end
 
 local function remember(s)
@@ -340,10 +391,16 @@ local function remember(s)
 	netlib.save("servers.txt", X4ShardSaved.servers)
 end
 
--- "host", "host:port" (default port 47110), either with "/code" (a private shard's invite) and "x4shard://" in
--- front or not -> host, port, invite code
+-- "host", "host:port" (default port 47110), with "/code" (a private shard's invite) and "#fingerprint" (its
+-- certificate) or not, with "x4shard://" in front or not -> host, port, invite code, fingerprint
 local function parseAddress(text)
 	text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("^x4shard://", "")
+	local fp
+	text, fp = text:match("^([^#]*)#?(%x*)$")
+	if not text or (fp ~= "" and not fingerprintOf(fp)) then
+		return
+	end
+	fp = fingerprintOf(fp)
 	local hostport, invite = text:match("^([^/]+)/(%w+)/?$")
 	if not hostport then
 		hostport = text:match("^([^/]+)/?$")
@@ -357,7 +414,7 @@ local function parseAddress(text)
 	end
 	port = tonumber(port)
 	if host and port and port >= 1 and port <= 65535 and (not invite or #invite <= 32) then
-		return host, port, invite
+		return host, port, invite, fp
 	end
 end
 
@@ -383,7 +440,7 @@ local function showPicker()
 	log("server list shown: " .. table.concat(labels, ", "))
 end
 
-local function pickAgain(seconds)
+pickAgain = function (seconds)
 	net.phase, net.pickAgain = "pick", now() + seconds
 end
 
@@ -400,13 +457,20 @@ end
 -- Called by the address window
 X4Shard = {
 	joinAddress = function (text)
-		local host, port, invite = parseAddress(text)
+		local host, port, invite, fp = parseAddress(text)
 		if not host then
 			notify("X4 Shard: not a server address: " .. tostring(text))
 			return pickAgain(3)
 		end
 		X4ShardSaved.lastAddress = text
-		choose({ name = host .. ":" .. port, host = host, port = port, invite = invite })
+		if not fp then   -- a bare address: the certificate this shard showed before, if the player was there
+			for _, old in ipairs(recentServers()) do
+				if old.host == host and old.port == port then
+					fp = old.fp
+				end
+			end
+		end
+		choose({ name = host .. ":" .. port, host = host, port = port, invite = invite, fp = fp })
 	end,
 	cancelAddress = function ()
 		pickAgain(0)
@@ -414,7 +478,7 @@ X4Shard = {
 }
 
 -- The directory's list is complete: add the shards joined before, join the configured one or let the player pick.
-local function listDone()
+listDone = function ()
 	netlib.close()
 	net.state, net.inbuf, net.outq = "idle", "", {}
 	for _, recent in ipairs(recentServers()) do
@@ -542,15 +606,19 @@ handleLine = function (line)
 		dockAt(f[3])
 	elseif cmd == "SERVER" then
 		local host, port = tostring(f[3]):match("^[%w%.%-]+$"), tonumber(f[4])
-		if host and port then
-			servers[#servers + 1] = { name = f[2], host = host, port = port, players = f[5] or "0" }
+		if host and port then   -- the fingerprint is the one the directory saw when the shard registered
+			servers[#servers + 1] = { name = f[2], host = host, port = port, players = f[5] or "0", fp = fingerprintOf(f[7]) }
 		end
 	elseif cmd == "END" then
 		listDone()
 	elseif cmd == "CHALLENGE" then
-		-- a Steam login: sign the shard's random challenge (hex only, so nothing else gets signed)
+		-- a Steam login: sign the shard's random challenge (hex only, so nothing else gets signed) together with the
+		-- certificate this connection showed: a shard that passes on another shard's challenge gets a signature
+		-- the other one refuses
 		local nonce = tostring(f[2]):match("^%x+$")
-		local sig = nonce and identity.key and netlib.sign(identity.key, "x4shard-login|" .. nonce .. "|" .. identity.steamid)
+		local fp = netlib.fingerprint()
+		local sig = nonce and fp and identity.key
+			and netlib.sign(identity.key, "x4shard-login|" .. nonce .. "|" .. identity.steamid .. "|" .. fp)
 		if sig then
 			queue("PROOF|" .. sig .. "\n")
 		else

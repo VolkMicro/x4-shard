@@ -10,26 +10,33 @@ game has asteroids of that ware, up to a rate (token bucket) and what the hold t
 station the player is at; after entering a sector a ship waits a while before it mines or trades there.
 
 Login without passwords: the client has an ECDSA P-256 key made once (kept in the game's user data, synced by
-Steam Cloud), sends its Steam ID and public key, and signs this shard's random challenge (p256.py checks it).
-The first login binds the public key to that Steam ID; later logins must be signed by the same key. Nothing on
-the wire or known to a shard logs the player in again, and a shard knows the player whatever address it was
-reached at. A game without Steam is known by its key alone. Plain accounts by name (the bot, test setups) are
-for this machine and its local network only.
+Steam Cloud), sends its Steam ID and public key, and signs this shard's random challenge together with the
+fingerprint of the certificate the connection showed (p256.py checks it). The first login binds the public key to
+that Steam ID; later logins must be signed by the same key. Nothing on the wire or known to a shard logs the player
+in again: a shard that passes another shard's challenge to a player gets a signature bound to its own certificate,
+which the other shard refuses. A shard knows the player whatever address it was reached at. A game without Steam
+is known by its key alone. Plain accounts by name (the bot, test setups) are for this machine and its local
+network only.
 
 Any number of shards can run. A shard is unlisted unless it registers (--register-to) with a directory (a shard
 started with --directory), under a name nobody else holds and at an address where it answers. The client asks
 the directory for the list and lets the player pick a shard, or joins an address the player types. A private
 shard (--invite) lets in only players it knows and newcomers who bring its invite code, x4shard://host:port/code.
 
+Transport: TLS 1.2 or 1.3 on the shard's port, with the shard's own certificate (tlscert.py: made once next to the
+accounts file). The game checks the certificate by its SHA-256 fingerprint: the directory's comes with the mod, a
+listed shard's with the list (the directory checks it at REGISTER), a private shard's with its invite link
+x4shard://host:port/code#fingerprint, a shard joined by a bare address is remembered by the first one it showed.
+A plain-text connection is an X4 Shard older than 0.12: it is told to update.
 Protocol: UTF-8 text lines, fields split by '|'.
   client -> server  LIST|proto                                   (before HELLO: the shard list)
                     HELLO|name|proto[|steam_id|public_key[|invite]]  (signed login: then CHALLENGE, PROOF)
-                    PROOF|signature                              (over "x4shard-login|<nonce>|<steam_id>")
+                    PROOF|signature            (over "x4shard-login|<nonce>|<steam_id>|<certificate fingerprint>")
                     POS|sector_macro|x|y|z|yaw|pitch|roll        (sector space, metres and degrees)
                     MINED|ware|amount                            (cargo grew by mining)
                     SELL|station_eid|ware|amount                 (ware "all" / amount 0: everything the market buys)
-  shard -> directory REGISTER|name|host|port|players|description   (answer OK or NO|reason)
-  server -> client  SERVER|name|host|port|players|description ... END   (answer to LIST)
+  shard -> directory REGISTER|name|host|port|players|description|fingerprint   (answer OK or NO|reason)
+  server -> client  SERVER|name|host|port|players|description|fingerprint ... END   (answer to LIST)
                     CHALLENGE|nonce                              (sign it to log in)
                     WELCOME|pid|server_time|account_name|shard_name
                     DENIED|reason                                (login refused, the server closes)
@@ -57,14 +64,16 @@ import math
 import os
 import secrets
 import socket
+import ssl
 import string
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # p256.py next to this file, also under python -I
 import p256  # noqa: E402
+import tlscert  # noqa: E402
 
-PROTO = "3"
+PROTO = "4"   # 4: TLS, the login signature bound to the shard's certificate (0.12); 3: plain text (0.11)
 PUPPET_MACRO = "ship_arg_s_fighter_01_a_macro"
 PUPPET_OWNER = "argon"
 START_CREDITS = 10000
@@ -213,10 +222,31 @@ def invite_code(accounts_path):
     return code
 
 
-async def answers_as(host, port, name):
-    """Does a shard called name answer at host:port? Its LIST answer starts with its own row."""
+def client_tls():
+    """TLS to another shard: its certificate is checked by fingerprint, not by a certificate authority."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def peer_fingerprint(writer):
+    tls = writer.get_extra_info("ssl_object")
+    cert = tls.getpeercert(binary_form=True) if tls else None
+    return tlscert.fingerprint(cert) if cert else ""
+
+
+def is_fingerprint(text):
+    return len(text) == 64 and all(c in "0123456789abcdef" for c in text)
+
+
+async def answers_as(host, port, name, fingerprint):
+    """Does a shard called name answer at host:port, with the certificate of that fingerprint? Its LIST answer starts
+    with its own row."""
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 5)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=client_tls()), 5)
+        seen = peer_fingerprint(writer)
         writer.write(("LIST|%s\n" % PROTO).encode())
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), 5)
@@ -224,7 +254,44 @@ async def answers_as(host, port, name):
     except (OSError, asyncio.TimeoutError, ValueError):
         return False
     fields = line.decode("utf-8", "replace").rstrip("\r\n").split("|")
-    return len(fields) > 3 and fields[0] == "SERVER" and fields[1] == name and fields[3] == str(port)
+    return (seen == fingerprint and len(fields) > 3 and fields[0] == "SERVER" and fields[1] == name
+            and fields[3] == str(port))
+
+
+async def first_byte(sock, timeout):
+    """The first byte a client sent, left in the socket (MSG_PEEK): b"" when it closed, None when it says nothing."""
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    loop.add_reader(sock.fileno(), lambda: ready.done() or ready.set_result(None))
+    try:
+        await asyncio.wait_for(ready, timeout)
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        loop.remove_reader(sock.fileno())
+    try:
+        return sock.recv(1, socket.MSG_PEEK)
+    except (BlockingIOError, InterruptedError):
+        return None
+    except ConnectionError:
+        return b""
+
+
+async def listen(hosts, port):
+    """A listening socket for each address. The shard accepts by itself: it looks at the first byte before TLS."""
+    loop = asyncio.get_running_loop()
+    socks = []
+    for host in hosts:
+        family, kind, proto, _, addr = (await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM,
+                                                               flags=socket.AI_PASSIVE))[0]
+        sock = socket.socket(family, kind, proto)
+        if os.name == "posix":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(addr)
+        sock.listen(100)
+        sock.setblocking(False)
+        socks.append(sock)
+    return socks
 
 
 class Accounts:
@@ -260,9 +327,10 @@ class Directory:
         self.me = me
         self.entries = {}
 
-    def register(self, name, host, port, players, description):
+    def register(self, name, host, port, players, description, fingerprint):
         self.entries["%s:%s" % (host, port)] = {"name": name, "host": host, "port": port, "players": players,
-                                                "description": description, "seen": time.monotonic()}
+                                                "description": description, "fingerprint": fingerprint,
+                                                "seen": time.monotonic()}
 
     def live(self):
         cutoff = time.monotonic() - DIRECTORY_TTL
@@ -283,8 +351,9 @@ class Directory:
             return True
         return any(e["name"].lower() == name.lower() and (e["host"], e["port"]) != (host, port) for e in self.live())
 
-    def known(self, name, host, port):
-        return any((e["name"], e["host"], e["port"]) == (name, host, port) for e in self.live())
+    def known(self, name, host, port, fingerprint):
+        return any((e["name"], e["host"], e["port"], e["fingerprint"]) == (name, host, port, fingerprint)
+                   for e in self.live())
 
 
 class Player:
@@ -321,6 +390,7 @@ class Shard:
     def __init__(self, accounts, test, me, directory, invite=None):
         self.players = {}
         self.per_ip = {}
+        self.connections = 0
         self.ids = itertools.count(1)
         self.accounts = accounts
         self.test = test
@@ -446,7 +516,7 @@ class Shard:
     def on_proof(self, player, signature):
         """The signed challenge: the first login binds the public key to the Steam ID, later ones must match it."""
         claim, player.pending = player.pending, None
-        message = ("x4shard-login|%s|%s" % (claim["nonce"], claim["steam_id"])).encode()
+        message = ("x4shard-login|%s|%s|%s" % (claim["nonce"], claim["steam_id"], self.me["fingerprint"])).encode()
         if not p256.verify(claim["pubkey"], message, signature):
             player.send("DENIED", "the login signature does not match")
             log.info("hello pid=%d steam=%s refused: bad signature", player.pid, claim["steam_id"])
@@ -563,15 +633,22 @@ class Shard:
 
     def on_list(self, player):
         for row in self.directory.listing(self.online(), player.peer[0] if player.peer else None):
-            player.send("SERVER", row["name"], row["host"], row["port"], row["players"], row["description"])
+            player.send("SERVER", row["name"], row["host"], row["port"], row["players"], row["description"],
+                        row.get("fingerprint", ""))
         player.send("END")
 
     async def on_register(self, player, fields):
         """Anyone may list a shard here: under a name nobody else holds, and only if a shard of that name answers
-        at the address it gives (checked when it first appears), so the list never sends players elsewhere."""
+        at the address it gives with the certificate it gives (checked when it first appears), so the list never
+        sends players elsewhere, and the fingerprint in the list is the one the players will meet."""
         name, host, port = clean(fields[1]), clean(fields[2], 64), int(fields[3])
         players, description = int(fields[4] or 0), clean(fields[5] if len(fields) > 5 else "", 80)
+        fingerprint = fields[6].strip().lower() if len(fields) > 6 else ""
         peer_ip = player.peer[0] if player.peer else ""
+        if not is_fingerprint(fingerprint):
+            player.send("NO", "update the shard server: since 0.12 it encrypts the connection")
+            log.info("directory: %s at %s:%d refused, no certificate fingerprint (an old server)", name, host, port)
+            return
         if not is_local(peer_ip) and not await resolves_to(host, peer_ip):
             # from the internet a shard lists only its own address: the check below connects there, and must not
             # be pointed at the home network or anyone else
@@ -582,11 +659,12 @@ class Shard:
             player.send("NO", "name taken")
             log.info("directory: %s at %s:%d refused, name taken", name, host, port)
             return
-        if not self.directory.known(name, host, port) and not await answers_as(host, port, name):
-            player.send("NO", "no shard named %s answers at %s:%d" % (name, host, port))
+        if (not self.directory.known(name, host, port, fingerprint)
+                and not await answers_as(host, port, name, fingerprint)):
+            player.send("NO", "no shard named %s answers at %s:%d with that certificate" % (name, host, port))
             log.info("directory: %s at %s:%d refused, does not answer as that shard", name, host, port)
             return
-        self.directory.register(name, host, port, players, description)
+        self.directory.register(name, host, port, players, description, fingerprint)
         player.send("OK")
         log.info("directory: %s at %s:%d registered (%d players)", name, host, port, players)
 
@@ -603,14 +681,73 @@ class Shard:
             player.send("TEST", "dock", eid)
             log.info("test: %s dock at %s", player.name, eid)
 
-    async def handle(self, reader, writer):
-        peer = writer.get_extra_info("peername")
-        ip = peer[0] if peer else "?"
-        if len(self.players) >= MAX_CONNECTIONS or self.per_ip.get(ip, 0) >= MAX_PER_IP:
-            log.info("connection from %s refused: too many", ip)
-            writer.close()
+    async def accept(self, listener, ctx):
+        """Connections of one listening socket. The limits count a connection from its first moment, TLS
+        handshake included."""
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                sock, peer = await loop.sock_accept(listener)
+            except OSError as err:   # out of file descriptors, say: the shard stays up
+                log.info("accept failed: %s", err)
+                await asyncio.sleep(1)
+                continue
+            ip = peer[0]
+            if self.connections >= MAX_CONNECTIONS or self.per_ip.get(ip, 0) >= MAX_PER_IP:
+                log.info("connection from %s refused: too many", ip)
+                sock.close()
+                continue
+            self.connections += 1
+            self.per_ip[ip] = self.per_ip.get(ip, 0) + 1
+            asyncio.create_task(self.connection(sock, peer, ctx))
+
+    async def connection(self, sock, peer, ctx):
+        """TLS from the first byte on (a TLS hello starts with 0x16); plain text is an X4 Shard older than 0.12."""
+        ip = peer[0]
+        loop = asyncio.get_running_loop()
+        writer = None
+        try:
+            sock.setblocking(False)
+            first = await first_byte(sock, FIRST_LINE_TIMEOUT)
+            if first:
+                tls = first == b"\x16"
+                reader = asyncio.StreamReader(limit=LINE_LIMIT)
+                protocol = asyncio.StreamReaderProtocol(reader)
+                transport, _ = await loop.connect_accepted_socket(
+                    lambda: protocol, sock, ssl=ctx if tls else None,
+                    ssl_handshake_timeout=FIRST_LINE_TIMEOUT if tls else None)
+                writer = asyncio.StreamWriter(transport, protocol, reader, loop)
+                if tls:
+                    await self.handle(reader, writer, peer)
+                else:
+                    await self.plaintext(reader, writer, ip)
+        except (OSError, asyncio.TimeoutError, ValueError) as err:   # ssl.SSLError is an OSError
+            log.info("connection from %s failed: %s", ip, str(err) or type(err).__name__)
+        finally:
+            if writer is not None:
+                writer.close()
+            else:
+                sock.close()
+            self.connections -= 1
+            self.per_ip[ip] -= 1
+            if not self.per_ip[ip]:
+                del self.per_ip[ip]
+
+    async def plaintext(self, reader, writer, ip):
+        """An X4 Shard older than 0.12 talks without TLS: its server list gets a single row that says to update, a
+        login a refusal that says so."""
+        try:
+            line = await asyncio.wait_for(reader.readline(), FIRST_LINE_TIMEOUT)
+        except (asyncio.TimeoutError, ValueError):
             return
-        self.per_ip[ip] = self.per_ip.get(ip, 0) + 1
+        if line.startswith(b"LIST"):
+            writer.write(b"SERVER|Update X4 Shard (Nexus Mods) to play|0.0.0.0|1|0|\nEND\n")
+        else:
+            writer.write(b"DENIED|update X4 Shard: since 0.12 the servers encrypt the connection\n")
+        log.info("plain-text client from %s (X4 Shard before 0.12): told to update", ip)
+        await close_after_refusal(reader, writer)
+
+    async def handle(self, reader, writer, peer):
         pid = next(self.ids)
         player = Player(pid, writer, peer)
         self.players[pid] = player
@@ -644,13 +781,10 @@ class Shard:
                 elif cmd == "BYE":
                     break
                 await writer.drain()
-        except (ConnectionError, ValueError, OverflowError, asyncio.TimeoutError) as err:
+        except (OSError, ValueError, OverflowError, asyncio.TimeoutError) as err:   # ConnectionError, SSLError
             log.info("pid=%d dropped: %s", pid, str(err) or type(err).__name__)
         finally:
             del self.players[pid]
-            self.per_ip[ip] -= 1
-            if not self.per_ip[ip]:
-                del self.per_ip[ip]
             if player.sector is not None:
                 for other in self.in_sector(player.sector):
                     other.send("DESPAWN", player.eid)
@@ -677,9 +811,10 @@ class Shard:
         while True:
             listed = False
             try:
-                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, int(port)), 10)
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, int(port), ssl=client_tls()), 10)
                 writer.write(("|".join(str(f) for f in ("REGISTER", self.me["name"], self.me["host"], self.me["port"],
-                                                        self.online(), self.me["description"])) + "\n").encode())
+                                                        self.online(), self.me["description"],
+                                                        self.me["fingerprint"])) + "\n").encode())
                 await writer.drain()
                 reply = (await asyncio.wait_for(reader.readline(), 15)).decode("utf-8", "replace").strip()
                 writer.close()
@@ -719,28 +854,35 @@ async def main():
         if args.test_dock:
             eid, after = args.test_dock.split(":")
             test["dock"] = (eid, float(after))
+    cert_path, key_path, fingerprint = tlscert.load_or_make(args.accounts)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert_path, key_path)
     me = {"name": clean(args.name), "host": args.public_host or args.host.split(",")[0],
           "port": args.public_port or args.port, "description": clean(args.description, 80),
           # clients on the shard's own network get its LAN address (see Directory.listing)
-          "lan_host": args.lan_host}
+          "lan_host": args.lan_host, "fingerprint": fingerprint}
     directory = Directory(me)
     if not args.directory:
         directory.entries = None
     shard = Shard(Accounts(args.accounts), test, me, directory, invite_code(args.accounts) if args.invite else None)
-    server = await asyncio.start_server(shard.handle, host=args.host.split(","), port=args.port, limit=LINE_LIMIT)
-    log.info("listening on %s as '%s' (%s:%s)%s", ", ".join(str(s.getsockname()) for s in server.sockets),
-             me["name"], me["host"], me["port"], ", directory" if args.directory else "")
+    listeners = await listen(args.host.split(","), args.port)
+    for listener in listeners:
+        asyncio.create_task(shard.accept(listener, ctx))
+    log.info("listening on %s as '%s' (%s:%s)%s, TLS certificate %s", ", ".join(str(s.getsockname()) for s in listeners),
+             me["name"], me["host"], me["port"], ", directory" if args.directory else "", fingerprint)
     if shard.invite:
-        log.info("private: invite link x4shard://%s:%s/%s", me["host"], me["port"], shard.invite)
+        log.info("private: invite link x4shard://%s:%s/%s#%s", me["host"], me["port"], shard.invite, fingerprint)
     elif not args.register_to and not args.directory:
-        log.info("unlisted: players join by address %s:%s", me["host"], me["port"])
+        log.info("unlisted: players join by the address x4shard://%s:%s#%s", me["host"], me["port"], fingerprint)
     asyncio.create_task(shard.report())
     if args.register_to:
         asyncio.create_task(shard.register_loop(args.register_to))
-    async with server:
-        await server.serve_forever()
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    if sys.platform == "win32":   # the shard watches sockets for their first byte: a selector loop
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
