@@ -4,14 +4,16 @@ usage: python -I tests/test_server.py
 Starts a directory shard on 127.0.0.1:47199, a second shard on 47198 that registers with it and a private one on
 47196 (--invite), then plays: server list, listings refused (taken name, nobody answering, another shard's
 address), signed Steam login on both shards (and a stolen Steam ID with another key, a replayed signature, an old
-client), mining within and over the rate limit, selling too far and at the hub, reconnect with the wallet kept,
-the private shard with no, a wrong and the right invite code.
+client), the server holding a ship to what it can do (a jump to the ore field is cut back, mining counts only in
+the field, within the rate limit and the hold, trade waits after entering a sector), selling too far and at the
+hub, reconnect with the wallet kept, the private shard with no, a wrong and the right invite code.
 """
 import asyncio
 import os
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "server"))
@@ -19,6 +21,7 @@ import p256  # noqa: E402
 
 PORT, PORT_B, PORT_P = 47199, 47198, 47196
 HUB = (6000.0, 0.0, -9000.0)
+START_POS = (0.0, 0.0, -7000.0)   # where the game start puts the ship, 7 km from the ore field at the centre
 SECTOR = "cluster_13_sector001_macro"
 STEAM_ID = "76561190000000001"
 KEY = p256.keygen()
@@ -127,23 +130,37 @@ async def scenario(tmp):
         assert value(got, "WELCOME|")[3:] == ["NoSteam", "Test B"], got
         await c.close()
 
+    # the server holds the ship to what it can do: at the start, 7 km from the ore field, nothing to mine, and a jump
+    # straight into the field is cut back to MAX_SPEED
     c = await Client.login("Tester")
     await c.lines()
-    c.send("POS", SECTOR, 0, 0, 5000, 0, 0, 0)
+    c.send("POS", SECTOR, *START_POS, 0, 0, 0)
+    c.send("POS", SECTOR, 0, 0, 0, 0, 0, 0)
+    c.send("MINED", "ore", 10)
+    got = await c.lines()
+    assert value(got, "CARGO|ore|") == ["CARGO", "ore", "0"] and any("No ore to mine here" in l for l in got), got
+    await asyncio.sleep(1.6)   # long enough to fly the 7 km
+    c.send("POS", SECTOR, 0, 0, 0, 0, 0, 0)
     c.send("MINED", "ore", 40)
     got = await c.lines()
-    assert not any(l.startswith("CARGO|ore") for l in got), "40 is within the burst, no correction expected"
+    assert not any(l.startswith("CARGO|ore") for l in got), "40 in the field is within the burst: %s" % got
     c.send("MINED", "ore", 100)
     corr = value(await c.lines(), "CARGO|ore|")
     assert corr and int(corr[2]) < 140, "rate limit must clip"
     ore = int(corr[2])
     c.send("SELL", "hub1", "all", 0)
     assert any("Too far" in l for l in await c.lines())
+    await asyncio.sleep(2.3)   # 11.5 km to the hub
     c.send("POS", SECTOR, HUB[0], HUB[1], HUB[2] - 800, 0, 0, 0)
     c.send("SELL", "hub1", "all", 0)
     got = await c.lines()
     assert value(got, "CARGO|ore|") == ["CARGO", "ore", "0"], got
     assert value(got, "WALLET|") == ["WALLET", str(10000 + ore * 50)], got
+    # out through a gate and back in at once: mining and trade wait a minute after entering a sector
+    c.send("POS", "cluster_14_sector001_macro", 0, 0, 0, 0, 0, 0)
+    c.send("POS", SECTOR, HUB[0], HUB[1], HUB[2] - 800, 0, 0, 0)
+    c.send("SELL", "hub1", "all", 0)
+    assert any("Just arrived" in l for l in await c.lines()), "trade must wait after entering a sector"
     await c.close()
 
     c = await Client.login("Tester renamed")
@@ -200,8 +217,44 @@ async def scenario(tmp):
                                    "lan_host": "192.168.1.10"})
     assert home.listing(0, "1.1.1.1")[0]["host"] == "mc.example.org", "the internet gets the public address"
     assert home.listing(0, "192.168.1.20")[0]["host"] == "192.168.1.10", "its own network gets the LAN address"
+
+    # where mining counts: the ore field at the centre (with the laser's 3 km), the long tube far out, nowhere else
+    field_for = shard_server.field_for
+    assert field_for(SECTOR, (0, 0, 0), "ore") and field_for(SECTOR, (5400, 3900, 0), "ore")
+    assert not field_for(SECTOR, START_POS, "ore") and not field_for(SECTOR, HUB, "ore")
+    assert not field_for(SECTOR, (0, 0, 0), "silicon") and field_for(SECTOR, (-89184.9, 0, -72944.6), "silicon")
+    assert not field_for(SECTOR, (0, 0, 0), "hydrogen") and not field_for("cluster_14_sector001_macro", (0, 0, 0), "ore")
+
+    # in this process, with the server's clock in hand: a jump is held to MAX_SPEED, the hold takes 2600 m3
+    class Sink:
+        def __init__(self):
+            self.lines = []
+
+        def write(self, data):
+            self.lines.append(data.decode().rstrip("\n"))
+
+    clock = [1000.0]
+    shard_server.clock = lambda: clock[0]
+    accounts = shard_server.Accounts(os.path.join(tmp, "unit.json"))
+    me = {"name": "Unit", "host": "127.0.0.1", "port": 1, "description": ""}
+    shard = shard_server.Shard(accounts, {}, me, shard_server.Directory(me))
+    p = shard_server.Player(1, Sink(), ("127.0.0.1", 1))
+    p.account = accounts.get("unit", "Unit")
+    shard.welcome(p, "Unit", "-")
+    shard.on_pos(p, ["POS", SECTOR] + [str(v) for v in START_POS] + ["0", "0", "0"])
+    clock[0] += 1.0
+    shard.on_pos(p, ["POS", SECTOR, "0", "0", "3000", "0", "0", "0"])   # 10 km in a second
+    assert abs(p.pose[2] - (START_POS[2] + shard_server.MAX_SPEED + 1)) < 1, p.pose
+    clock[0] += 10.0
+    shard.on_pos(p, ["POS", SECTOR, "0", "0", "0", "0", "0", "0"])
+    assert p.pose[:3] == (0.0, 0.0, 0.0), "given the time, the ship is where it says: %s" % (p.pose,)
+    p.account["cargo"] = {"ore": 250, "silicon": 3}
+    shard.on_mined(p, "ore", 20)
+    assert p.account["cargo"]["ore"] == 257 and any("hold is full" in l for l in p.writer.lines), p.account
+    shard_server.clock = time.monotonic
     print("ok: list of 2 shards, fake listings refused, signed Steam login on both shards, stolen ID, replayed "
-          "signature and old client refused, mined %d ore, sold for %d Cr, wallet persisted, NaN and POS flood "
+          "signature and old client refused, jump to the field held back, no mining outside it, mined %d ore, sold "
+          "for %d Cr, trade waits after a sector change, hold full at 2600 m3, wallet persisted, NaN and POS flood "
           "stopped, 8 connections per address, key-only login, private shard by invite" % (ore, ore * 50))
 
 

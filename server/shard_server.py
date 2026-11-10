@@ -3,8 +3,11 @@
 The server owns what exists: static world entities per sector and one puppet per connected player.
 Clients (X4 with the x4shard extension, or tools/fakepilot.py) report their ship pose; the server stamps
 it with its own clock and relays it to the other players in that sector.
-Each player has an account (credits, cargo of minable wares) kept in accounts.json. Mining is reported by the
-client and accepted up to a rate (token bucket); selling happens at a market station the player is at.
+Each player has an account (credits, cargo of minable wares) kept in accounts.json. The server does not take a
+client's word for more than its ship can do: a position is held to what the ship can fly since the last one (a jump
+is cut to MAX_SPEED, and the others, selling and mining all follow the cut position); mining counts only where the
+game has asteroids of that ware, up to a rate (token bucket) and what the hold takes; selling happens at a market
+station the player is at; after entering a sector a ship waits a while before it mines or trades there.
 
 Login without passwords: the client has an ECDSA P-256 key made once (kept in the game's user data, synced by
 Steam Cloud), sends its Steam ID and public key, and signs this shard's random challenge (p256.py checks it).
@@ -79,6 +82,16 @@ IDLE_TIMEOUT = 600.0       # s of silence before a player is dropped (the game s
 POS_RATE, POS_BURST = 40.0, 80.0   # position reports per second a client may send (the game sends 20)
 LINE_LIMIT = 8192          # bytes per line from a client
 POSE_LIMIT = 1e7           # metres / degrees a reported pose may hold
+# The ship every player flies, from the game's data (the X4 Shard start: ship_arg_s_miner_solid_01_a with three
+# engine_arg_s_travel_01_mk1): 190 m/s, 1300 m/s boosting, 3750 m/s in travel mode; a hold of 2600 m3 for solid
+# wares; a mining laser (mk2) that reaches 3 km.
+MAX_SPEED = 4500.0         # m/s a ship may move; a faster report is cut to this (on a local highway, which is
+                           # faster, the copy the others see lags behind and catches up when the ship slows down)
+HOLD_VOLUME = 2600.0       # m3 of solid wares
+WARE_VOLUME = {"ore": 10, "silicon": 10, "ice": 8, "nividium": 10}   # m3 a unit (gases need a gas miner)
+MINING_RANGE = 3000.0      # m past the edge of a field the laser still reaches an asteroid
+TRANSIT_LOCK = 60.0        # s after a ship enters a sector before it mines or trades there: no shortcut by hopping
+START = ("cluster_13_sector001_macro", (0.0, 0.0, -7000.0))   # where the X4 Shard game start puts the ship
 
 # Static world, sector space. Second Contact II Flashpoint: a high-yield ore field (r 2.5 km) at the sector
 # centre; the clean-universe start is at (0, 0, -7000) facing it, the hub 6 km to the side of the start.
@@ -92,12 +105,55 @@ WORLD = {
     ],
 }
 
+# Where the game has minable asteroids, sector space (maps/xu_ep2_universe/clusters.xml places the regions,
+# libraries/region_definitions.xml shapes them).
+FIELDS = {
+    "cluster_13_sector001_macro": [
+        # region_highyield_ore at the sector centre: a cylinder r 2500 m, 2000 m high
+        {"wares": ("ore",), "centre": (0.0, 0.0, 0.0), "r": 2500.0, "height": 2000.0},
+        # region_cluster_13_sector_001: a tube r 8000 m along a spline through these points (here straight lines
+        # between them), far from the centre
+        {"wares": ("ore", "silicon"), "r": 8000.0, "spline": [
+            (-171084.0, 0.0, -59219.8), (-89184.9, 0.0, -72944.6), (-14345.2, 0.0, -150607.0),
+            (151426.0, 0.0, -195769.0), (44535.9, 0.0, -127229.0), (137080.0, 0.0, -61876.4),
+            (-15407.8, 0.0, -17777.0), (-128579.0, 0.0, 41199.3), (-82271.9, 0.0, 72968.2),
+            (-110514.0, 0.0, 132586.0), (28691.6, 0.0, 102301.0), (-7509.33, 0.0, 44851.9),
+            (202433.0, 0.0, 65108.6), (86491.3, 0.0, 87838.1), (158333.0, 0.0, 175623.0),
+            (35040.1, 0.0, 141392.0), (-54725.3, 0.0, 243100.0)]},
+    ],
+}
+
 log = logging.getLogger("shard")
 T0 = time.monotonic()
+clock = time.monotonic   # the server's clock for limits (tests put a fake one here)
 
 
 def now():
     return time.monotonic() - T0
+
+
+def segment_distance(p, a, b):
+    """Distance from point p to the segment a-b."""
+    ab = [b[i] - a[i] for i in range(3)]
+    n = sum(v * v for v in ab)
+    k = max(0.0, min(1.0, sum((p[i] - a[i]) * ab[i] for i in range(3)) / n)) if n else 0.0
+    return math.dist(p, [a[i] + ab[i] * k for i in range(3)])
+
+
+def field_for(sector, pos, ware):
+    """The field where a ship at pos can mine ware (its laser reaches MINING_RANGE past the edge), or None."""
+    for field in FIELDS.get(sector, []):
+        if ware not in field["wares"]:
+            continue
+        if "centre" in field:
+            cx, cy, cz = field["centre"]
+            if (math.hypot(pos[0] - cx, pos[2] - cz) <= field["r"] + MINING_RANGE
+                    and abs(pos[1] - cy) <= field["height"] / 2 + MINING_RANGE):
+                return field
+        elif any(segment_distance(pos, a, b) <= field["r"] + MINING_RANGE
+                 for a, b in zip(field["spline"], field["spline"][1:])):
+            return field
+    return None
 
 
 def clean(text, limit=40):
@@ -243,9 +299,13 @@ class Player:
         self.pos_count = 0
         self.account = None
         self.tokens = MINE_BURST
-        self.tokens_at = time.monotonic()
+        self.tokens_at = clock()
         self.pos_tokens = POS_BURST
-        self.pos_at = time.monotonic()
+        self.pos_at = clock()
+        self.pose_at = 0.0         # clock() when the pose was taken
+        self.login_at = clock()
+        self.transit_until = 0.0   # mining and trading wait until then (the ship has just entered a sector)
+        self.said = {}             # refusal text -> clock() when it was last said
         self.pending = None    # Steam login waiting for its signed challenge
 
     def send(self, *fields):
@@ -295,9 +355,45 @@ class Shard:
         log.info("%s (%s) entered %s, world entities %d, players there %d", player.name, player.eid, sector,
                  len(WORLD.get(sector, [])), len(self.in_sector(sector, but=player)))
 
+    def tell(self, player, text):
+        """A refusal for the player to read, at most once every 10 s per text (a client may repeat a report)."""
+        t = clock()
+        if t - player.said.get(text, -99.0) >= 10:
+            player.said[text] = t
+            player.send("SAY", text)
+
+    def held(self, player, origin, since, pose, t):
+        """pose, cut back to what a ship at origin at clock() since can have reached by t at MAX_SPEED."""
+        d = math.dist(origin, pose[:3])
+        reach = MAX_SPEED * max(0.0, t - since) + 1.0
+        if d <= reach:
+            return pose
+        if t - player.said.get("held", -99.0) >= 10:
+            player.said["held"] = t
+            log.info("%s reported %.0f m in %.2f s, held to %.0f m/s", player.name, d, max(0.0, t - since), MAX_SPEED)
+        k = reach / d
+        return tuple(o + (p - o) * k for o, p in zip(origin, pose[:3])) + tuple(pose[3:])
+
+    def first_pose(self, player, sector, pose, t):
+        """Where a ship can be when it first reports: at the game start, or where it was when it last left (a game
+        that reconnects), plus what it could have flown since. Anything farther is cut back."""
+        refs = [(START[0], START[1], player.login_at)]
+        last = player.account.get("last_pose")
+        if last:
+            refs.append((last[0], tuple(last[1:4]), t - max(0.0, time.time() - last[4])))
+        here = [r for r in refs if r[0] == sector]
+        if not here:   # a sector it was not seen entering: positions start there, mining and trading wait
+            player.transit_until = t + TRANSIT_LOCK
+            return pose
+        origin, since = min(((r[1], r[2]) for r in here),
+                            key=lambda r: math.dist(r[0], pose[:3]) - MAX_SPEED * (t - r[1]))
+        return self.held(player, origin, since, pose, t)
+
     def on_pos(self, player, fields):
-        """Relayed to the sector: at most POS_RATE a second, finite numbers only (NaN would reach every client)."""
-        t = time.monotonic()
+        """Relayed to the sector: at most POS_RATE a second, finite numbers only (NaN would reach every client), no
+        faster than the ship flies (a jump is cut to MAX_SPEED; the copy others see, selling and mining all go by
+        the cut position)."""
+        t = clock()
         player.pos_tokens = min(POS_BURST, player.pos_tokens + (t - player.pos_at) * POS_RATE)
         player.pos_at = t
         if player.pos_tokens < 1:
@@ -308,7 +404,13 @@ class Shard:
         if not all(math.isfinite(v) and abs(v) < POSE_LIMIT for v in pose):
             return
         first = player.pose is None
-        player.pose = pose
+        if first:
+            pose = self.first_pose(player, sector, pose, t)
+        elif sector == player.sector:
+            pose = self.held(player, player.pose[:3], player.pose_at, pose, t)
+        else:   # through a gate or a superhighway: a fresh start there, but mining and trading wait a while
+            player.transit_until = t + TRANSIT_LOCK
+        player.pose, player.pose_at = pose, t
         player.pos_count += 1
         if first or sector != player.sector:
             self.enter_sector(player, sector)
@@ -371,6 +473,7 @@ class Shard:
 
     def welcome(self, player, name, steam_id):
         player.name = name
+        player.login_at = clock()
         player.send("WELCOME", player.pid, "%.3f" % now(), name, self.me["name"])
         self.send_account(player)
         log.info("hello pid=%d name=%s steam=%s credits=%d cargo=%s", player.pid, name, steam_id,
@@ -385,19 +488,38 @@ class Shard:
             player.send("CARGO", ware, acc["cargo"].get(ware, 0))
 
     def on_mined(self, player, ware, amount):
+        """Mining counts where the game has asteroids of that ware (FIELDS, with the laser's reach), not right after
+        entering the sector, up to MINE_RATE and what the hold takes. A refused report gets the true cargo back (the
+        client mirrors it)."""
         if ware not in MINABLE or amount <= 0:
             return
-        t = time.monotonic()
+        cargo = player.account["cargo"]
+        t = clock()
+        if self.test.get("name") != player.name:   # the scripted VM test mines wherever the ship is
+            why = None
+            if player.pose is None or not field_for(player.sector, player.pose[:3], ware):
+                why = "No %s to mine here: mining counts in the asteroid fields of the sector" % ware
+            elif t < player.transit_until:
+                why = "Just arrived in this sector: mining and trade count a minute after you enter it"
+            if why:
+                player.send("CARGO", ware, cargo.get(ware, 0))
+                self.tell(player, why)
+                log.info("%s mined %d %s, refused: %s", player.name, amount, ware, why)
+                return
         player.tokens = min(MINE_BURST, player.tokens + (t - player.tokens_at) * MINE_RATE)
         player.tokens_at = t
-        accepted = min(amount, int(player.tokens))
+        used = sum(n * WARE_VOLUME.get(w, 10) for w, n in cargo.items())
+        room = max(0, int((HOLD_VOLUME - used) // WARE_VOLUME.get(ware, 10)))
+        accepted = min(amount, int(player.tokens), room)
         player.tokens -= accepted
-        cargo = player.account["cargo"]
         cargo[ware] = cargo.get(ware, 0) + accepted
         self.accounts.save()
         if accepted < amount:
             player.send("CARGO", ware, cargo[ware])
-            log.info("%s mined %d %s, accepted %d (rate limit), now %d", player.name, amount, ware, accepted, cargo[ware])
+            if accepted == room:
+                self.tell(player, "The cargo hold is full: sell at the trade station")
+            log.info("%s mined %d %s, accepted %d (%s), now %d", player.name, amount, ware, accepted,
+                     "hold full" if accepted == room else "rate limit", cargo[ware])
         else:
             log.info("%s mined %d %s, now %d", player.name, amount, ware, cargo[ware])
 
@@ -406,6 +528,10 @@ class Shard:
         market = station.get("market") if station else None
         if not market:
             player.send("SAY", "%s does not trade" % eid)
+            return
+        if clock() < player.transit_until:
+            self.tell(player, "Just arrived in this sector: mining and trade count a minute after you enter it")
+            log.info("%s sell at %s refused: just entered the sector", player.name, eid)
             return
         dist = None
         if player.pose is not None:
@@ -531,6 +657,10 @@ class Shard:
                     other.send("SAY", "%s left" % player.name)
             writer.close()
             if player.account is not None:
+                if player.pose is not None:   # a game that reconnects may be anywhere it could fly from here
+                    player.account["last_pose"] = ([player.sector] + [round(v, 1) for v in player.pose[:3]]
+                                                   + [round(time.time())])
+                    self.accounts.save()
                 log.info("disconnect pid=%d %s after %d positions", pid, player.name, player.pos_count)
 
     async def report(self):

@@ -10,7 +10,8 @@ you, and the server keeps your credits and cargo. Anyone can run a server.
 | One sector (Second Contact II Flashpoint) with a trade station | More sectors and content |
 | Other players' ships in your sector, smoothed at 20 updates/s | Combat between players or against shared enemies |
 | Mining ore and selling it at the station; credits and cargo kept by the server | Buying ships, trading between players |
-| A server list in the game, joining by address, private servers by invite | Encrypted traffic (TLS) |
+| The server checks what clients report: no teleports, no mining outside a field, no overfull hold | Encrypted traffic (TLS) |
+| A server list in the game, joining by address, private servers by invite | |
 | Login by Steam account with a signed challenge, no passwords | |
 
 ## How it works
@@ -18,11 +19,17 @@ you, and the server keeps your credits and cargo. Anyone can run a server.
 X4 is only the client. A game started from the **X4 Shard** start has no NPC economy of its own (a clean
 universe); the extension asks the server what exists and places it, and moves other players' ships where the
 server says they are. The server is a small Python program (`server/`): it owns the world, the accounts and the
-rules, and it checks what clients report (mining is rate-limited, selling only works at the station, poses must be
-finite numbers in range).
+rules, and it does not take a client's word for more than its ship can do. Positions are held to the ship's top
+speed from the game's data (190 m/s, 3750 m/s in travel mode; a jump is cut back), mining counts only in the
+sector's asteroid fields (also from the game's data) and up to the hold's 2600 m³, selling only at the station,
+and mining and trade wait a minute after a ship enters a sector.
 
-Combat is not synchronised yet. The plan is the same server authority: the server decides what got hit, clients
-only report and show it.
+What it is not: X4's own galaxy shared online. X4's economy and AI stay switched off; the shard's world is small
+and lives in one server process, so there is no X4 simulation to keep in sync between players.
+
+Combat is not synchronised yet. The plan: the server flies the shared enemies with its own simple physics and
+decides what got hit from its own positions and weapon data; clients only report that they fired and show the
+result.
 
 ## Install
 
